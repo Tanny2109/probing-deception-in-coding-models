@@ -65,8 +65,8 @@ class ProbeConfig:
 @dataclass
 class SteeringConfig:
     """Activation steering configuration"""
-    steering_strength: float = 1.0
-    target_layers: List[int] = field(default_factory=lambda: [14, 15, 16])  # Middle layers
+    steering_strengths: List[float] = field(default_factory=lambda: [1.0, 5.0, 10.0])
+    target_layers: List[int] = field(default_factory=lambda: [17, 18, 19])  # Best separability layers
 
 
 @dataclass

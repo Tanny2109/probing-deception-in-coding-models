@@ -40,29 +40,52 @@ class ActivationSteerer:
 
     Adds or subtracts a direction vector from hidden states
     at specified layers during the forward pass.
+    Uses PER-LAYER directions for more accurate steering.
     """
 
     def __init__(
         self,
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
-        steering_vector: np.ndarray,
+        steering_vectors: Dict[int, np.ndarray],  # layer -> direction
         target_layers: List[int],
         steering_strength: float = 1.0,
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.steering_vector = torch.tensor(
-            steering_vector, dtype=model.dtype, device=model.device
-        )
+        self.steering_vectors_np = {
+            layer: vec for layer, vec in steering_vectors.items()
+            if layer in target_layers
+        }
         self.target_layers = target_layers
         self.steering_strength = steering_strength
         self.hooks = []
         self.active = False
 
+        # Get transformer layers to determine device for each layer
+        if hasattr(model, 'model'):
+            self.transformer_layers = model.model.layers
+        elif hasattr(model, 'transformer'):
+            self.transformer_layers = model.transformer.h
+        else:
+            raise ValueError("Unknown model architecture")
+
+        # Convert vectors to tensors on the correct device for each layer
+        self.steering_vectors = {}
+        for layer in target_layers:
+            if layer in self.steering_vectors_np and layer < len(self.transformer_layers):
+                # Get the device of this specific layer
+                layer_device = next(self.transformer_layers[layer].parameters()).device
+                self.steering_vectors[layer] = torch.tensor(
+                    self.steering_vectors_np[layer],
+                    dtype=model.dtype,
+                    device=layer_device
+                )
+
     def _get_steering_hook(self, layer_idx: int, add: bool = True):
-        """Create a hook that adds/subtracts the steering vector."""
+        """Create a hook that adds/subtracts the steering vector for this layer."""
         multiplier = self.steering_strength if add else -self.steering_strength
+        layer_vector = self.steering_vectors[layer_idx]
 
         def hook(module, input, output):
             if not self.active:
@@ -71,10 +94,10 @@ class ActivationSteerer:
             if isinstance(output, tuple):
                 hidden_states = output[0]
                 # Add steering vector to all token positions
-                modified = hidden_states + multiplier * self.steering_vector
+                modified = hidden_states + multiplier * layer_vector
                 return (modified,) + output[1:]
             else:
-                return output + multiplier * self.steering_vector
+                return output + multiplier * layer_vector
 
         return hook
 
@@ -82,22 +105,12 @@ class ActivationSteerer:
         """Register forward hooks for steering."""
         self.remove_hooks()
 
-        # Get transformer layers
-        if hasattr(self.model, 'model'):
-            transformer_layers = self.model.model.layers
-        elif hasattr(self.model, 'transformer'):
-            transformer_layers = self.model.transformer.h
-        else:
-            raise ValueError("Unknown model architecture")
-
         for layer_idx in self.target_layers:
-            if layer_idx < len(transformer_layers):
-                hook = transformer_layers[layer_idx].register_forward_hook(
+            if layer_idx in self.steering_vectors:
+                hook = self.transformer_layers[layer_idx].register_forward_hook(
                     self._get_steering_hook(layer_idx, add=add)
                 )
                 self.hooks.append(hook)
-
-        print(f"Registered steering hooks on layers {self.target_layers}")
 
     def remove_hooks(self):
         """Remove all hooks."""
@@ -108,9 +121,9 @@ class ActivationSteerer:
     def generate(
         self,
         prompt: str,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 512,
         temperature: float = 0.7,
-        do_sample: bool = True,
+        do_sample: bool = False,  # Greedy for speed + determinism
     ) -> str:
         """Generate text with steering active."""
         inputs = self.tokenizer(
@@ -138,19 +151,31 @@ class ActivationSteerer:
         return generated_text
 
 
-def load_steering_resources(config: ExperimentConfig) -> Tuple[np.ndarray, int]:
-    """Load deception vector and determine best layer."""
-    # Load deception direction
-    deception_vector = np.load(config.probes_dir / "deception_direction.npy")
+def load_steering_resources(config: ExperimentConfig) -> Tuple[Dict[int, np.ndarray], int]:
+    """Load deception vectors for all layers and determine best layer."""
+    directions_dir = config.probes_dir / "directions"
+    results_path = config.probes_dir / "paired_analysis_results.json"
 
-    # Load probe results to find best layer
-    with open(config.probes_dir / "probe_results.json") as f:
-        probe_results = json.load(f)
+    if not directions_dir.exists():
+        raise FileNotFoundError(
+            "No deception directions found. Run analyze_paired_differences.py first."
+        )
 
-    best_layer = int(max(probe_results.keys(),
-                        key=lambda l: probe_results[l]['cv_mean']))
+    # Load results to find best layer
+    with open(results_path) as f:
+        results = json.load(f)
 
-    return deception_vector, best_layer
+    best_layer = results.get("best_layer_separability", 18)
+    print(f"Best layer by separability: {best_layer}")
+
+    # Load direction for each layer
+    deception_vectors = {}
+    for layer_file in directions_dir.glob("deception_direction_layer_*.npy"):
+        layer_num = int(layer_file.stem.split("_")[-1])
+        deception_vectors[layer_num] = np.load(layer_file)
+        print(f"  Loaded direction for layer {layer_num}")
+
+    return deception_vectors, best_layer
 
 
 def run_steering_experiment(
@@ -158,7 +183,7 @@ def run_steering_experiment(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     samples: List[TaskSample],
-    deception_vector: np.ndarray,
+    deception_vectors: Dict[int, np.ndarray],  # layer -> direction
     target_layers: List[int],
     n_samples: int = 10,
 ) -> List[SteeringResult]:
@@ -189,7 +214,7 @@ def run_steering_experiment(
 
         # 1. Baseline honest generation
         steerer = ActivationSteerer(
-            model, tokenizer, deception_vector, target_layers,
+            model, tokenizer, deception_vectors, target_layers,
             steering_strength=0.0  # No steering
         )
         steerer.register_hooks(add=True)
@@ -218,12 +243,9 @@ def run_steering_experiment(
         ))
 
         # 3. Honest + deception vector (should induce deceptive behavior)
-        for strength in config.steering.steering_strength if isinstance(
-            config.steering.steering_strength, list
-        ) else [config.steering.steering_strength]:
-
+        for strength in config.steering.steering_strengths:
             steerer = ActivationSteerer(
-                model, tokenizer, deception_vector, target_layers,
+                model, tokenizer, deception_vectors, target_layers,
                 steering_strength=strength
             )
             steerer.register_hooks(add=True)
@@ -233,19 +255,16 @@ def run_steering_experiment(
             results.append(SteeringResult(
                 task_id=sample.task_id,
                 category=sample.category,
-                condition="honest+deception",
+                condition=f"honest+deception_s{strength}",
                 prompt=sample.user_prompt,
                 generation=gen_steered,
                 steering_strength=strength
             ))
 
         # 4. Deceptive - deception vector (should prevent deceptive behavior)
-        for strength in config.steering.steering_strength if isinstance(
-            config.steering.steering_strength, list
-        ) else [config.steering.steering_strength]:
-
+        for strength in config.steering.steering_strengths:
             steerer = ActivationSteerer(
-                model, tokenizer, deception_vector, target_layers,
+                model, tokenizer, deception_vectors, target_layers,
                 steering_strength=strength
             )
             steerer.register_hooks(add=False)  # Subtract
@@ -255,7 +274,7 @@ def run_steering_experiment(
             results.append(SteeringResult(
                 task_id=sample.task_id,
                 category=sample.category,
-                condition="deceptive-deception",
+                condition=f"deceptive-deception_s{strength}",
                 prompt=sample.user_prompt,
                 generation=gen_steered,
                 steering_strength=strength
@@ -306,58 +325,89 @@ def print_sample_comparisons(results: List[SteeringResult], n: int = 3):
         task_results = by_task[task_id]
         print(f"\n{'─'*80}")
         print(f"Task: {task_id}")
-        print(f"Prompt: {task_results.get('honest_baseline', task_results.get('deceptive_baseline')).prompt[:100]}...")
 
-        for condition in ['honest_baseline', 'deceptive_baseline', 'honest+deception', 'deceptive-deception']:
-            if condition in task_results:
-                r = task_results[condition]
-                print(f"\n[{condition.upper()}] (strength={r.steering_strength}):")
-                # Show first 300 chars of generation
-                gen_preview = r.generation[:300].replace('\n', ' ')
-                print(f"  {gen_preview}...")
+        # Get any result to show the prompt
+        any_result = list(task_results.values())[0]
+        print(f"Prompt: {any_result.prompt[:100]}...")
+
+        # Show baselines first, then steered results by strength
+        for condition in sorted(task_results.keys()):
+            r = task_results[condition]
+            print(f"\n[{condition.upper()}] (strength={r.steering_strength}):")
+            # Show first 300 chars of generation
+            gen_preview = r.generation[:300].replace('\n', ' ')
+            print(f"  {gen_preview}...")
 
     print("\n" + "="*80)
+
+
+def print_summary_stats(results: List[SteeringResult]):
+    """Print summary statistics about the steering results."""
+    from collections import defaultdict
+
+    # Group by condition
+    by_condition = defaultdict(list)
+    for r in results:
+        by_condition[r.condition].append(r)
+
+    print("\n" + "="*80)
+    print("SUMMARY STATISTICS")
+    print("="*80)
+
+    for condition in sorted(by_condition.keys()):
+        samples = by_condition[condition]
+        avg_len = sum(len(s.generation) for s in samples) / len(samples)
+        print(f"{condition}: {len(samples)} samples, avg generation length: {avg_len:.0f} chars")
 
 
 def main():
     """Main steering experiment function."""
     config = get_config()
 
-    # Check if probes exist
-    if not (config.probes_dir / "deception_direction.npy").exists():
-        print("Error: No deception direction found.")
-        print("Please run train_probe.py first.")
+    # Check if directions exist
+    directions_dir = config.probes_dir / "directions"
+    if not directions_dir.exists():
+        print("Error: No deception directions found.")
+        print("Please run analyze_paired_differences.py first.")
         return
 
     # Load resources
-    print("Loading deception vector and model...")
-    deception_vector, best_layer = load_steering_resources(config)
+    print("Loading deception vectors and model...")
+    deception_vectors, best_layer = load_steering_resources(config)
 
     # Determine target layers (use best layer and neighbors)
     target_layers = [best_layer - 1, best_layer, best_layer + 1]
-    target_layers = [l for l in target_layers if 0 <= l < config.model.n_layers]
+    target_layers = [l for l in target_layers if l in deception_vectors]
 
-    print(f"Using deception vector from layer {best_layer}")
+    print(f"Best layer: {best_layer}")
     print(f"Steering target layers: {target_layers}")
 
     # Load model
     from collect_activations import load_model
     model, tokenizer = load_model(config)
 
-    # Generate test samples
+    # Generate test samples - fewer samples but full code generation
     print("\nGenerating test samples...")
     samples = generate_prompts(
         categories=config.data.categories,
-        n_per_category=3,  # Fewer for steering experiments (they're slow)
+        n_per_category=5,  # 30 total samples (5 * 6 categories)
         seed=config.data.seed + 100  # Different seed for test
     )
 
+    n_strengths = len(config.steering.steering_strengths)
+    n_conditions = 2 + n_strengths * 2  # 2 baselines + strengths * 2 directions
+
     # Run experiments
-    print("\nRunning steering experiments...")
+    print(f"\nRunning steering experiments on {len(samples)} samples...")
+    print(f"Steering strengths: {config.steering.steering_strengths}")
+    print(f"Target layers: {target_layers}")
+    print(f"Conditions per sample: {n_conditions} (2 baselines + {n_strengths} strengths × 2 directions)")
+    print(f"Total generations: {len(samples) * n_conditions}")
+
     results = run_steering_experiment(
         config, model, tokenizer, samples,
-        deception_vector, target_layers,
-        n_samples=10
+        deception_vectors, target_layers,
+        n_samples=30  # Use all 30 samples
     )
 
     # Save results
@@ -366,8 +416,9 @@ def main():
         config.results_dir / "steering_results.json"
     )
 
-    # Print comparisons
-    print_sample_comparisons(results, n=5)
+    # Print comparisons and stats
+    print_sample_comparisons(results, n=3)
+    print_summary_stats(results)
 
     print("\nSteering experiment complete!")
     print(f"Results saved to: {config.results_dir / 'steering_results.json'}")

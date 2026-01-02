@@ -212,11 +212,13 @@ def collect_all_activations(
     # Get final activations
     activations = collector.get_activations()
 
-    # Convert to numpy
-    activations_np = {
-        layer: acts.numpy()
-        for layer, acts in activations.items()
-    }
+    # Convert to numpy (convert to float32 first if bfloat16)
+    activations_np = {}
+    for layer, acts in activations.items():
+        # Convert bfloat16 to float32 before numpy conversion
+        if acts.dtype == torch.bfloat16:
+            acts = acts.float()
+        activations_np[layer] = acts.numpy()
 
     return ActivationData(
         activations=activations_np,
